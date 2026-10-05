@@ -1,0 +1,275 @@
+"""Stage 3b — Train LightGBM on pairwise features, get out-of-fold probabilities,
+apply exclusivity, and sweep the decision threshold against the EXACT competition
+metric (macro F0.5, from metric.py) — not a proxy like AUC or pairwise F1.
+
+GroupKFold by source1_entity_id: every pair for one S1 lands in the same fold, so
+no S1's pairs leak between train and validation.
+
+Exclusivity (confirmed as a hard, zero-violation rule on 7.6M ground-truth pairs —
+see experiments.md): each candidate goes to its single best-scoring S1 only, applied
+once on raw OOF probability, before threshold selection.
+
+Usage:
+  python src/train.py --features ../../artifacts/features_train_sample50k.parquet \
+      --gt ../../student_resource/dataset/train/train_ground_truth.tsv \
+      --out-oof ../../artifacts/oof_train_sample50k.parquet
+"""
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from sklearn.model_selection import GroupKFold
+
+from metric import parse_id_list, score_breakdown
+
+
+def read_features_parquet(path) -> pd.DataFrame:
+    """Plain pd.read_parquet() crashed with a MemoryError at full train scale (43.4M rows):
+    the two id columns as plain `object` dtype means one Python string object per row (over
+    86M of them total) — far heavier than the ~900MB on-disk size suggests.
+
+    Reading the WHOLE table at once via pyarrow with strings_to_categorical=True (an earlier
+    fix attempt) still crashed: pq.read_table() builds the full Arrow table — all 28 columns,
+    strings included, in Arrow's own (still substantial) in-memory format — before any
+    conversion to pandas / categorical happens at all, so that intermediate step alone needs
+    peak memory close to what loading everything as-is would.
+
+    Fix: read the 26 numeric feature + label columns together (cheap — no strings at all),
+    and read each of the two id columns as its OWN separate single-column read, converted to
+    categorical immediately. Splitting the reads means the string columns' data is never in
+    memory at the same time as the full numeric block during the same read call. Same
+    approach needed in decide.py, which reads this same file shape."""
+    schema_cols = pq.read_schema(path).names
+    numeric_cols = [c for c in schema_cols if c.startswith("f_") or c == "label"]
+    df = pd.read_parquet(path, columns=numeric_cols)
+    for id_col in ("source1_entity_id", "candidate_entity_id"):
+        if id_col in schema_cols:
+            df[id_col] = pq.read_table(path, columns=[id_col]).to_pandas(strings_to_categorical=True)[id_col]
+    return df
+
+FEATURE_PREFIX = "f_"
+LGB_PARAMS = dict(
+    objective="binary",
+    metric="auc",
+    learning_rate=0.05,
+    num_leaves=31,
+    min_data_in_leaf=50,
+    feature_fraction=0.9,
+    bagging_fraction=0.8,
+    bagging_freq=5,
+    verbosity=-1,
+)
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 0,
+              memmap_dir: Path | None = None, lgb_params: dict | None = None,
+              num_boost_round: int = 500, early_stopping_rounds: int = 30) -> tuple:
+    """Returns (oof, importances, models) — `models` is the list of per-fold LightGBM
+    boosters. These are what decide.py needs for inference on test data: OOF predictions
+    alone (what this function used to return) are only useful for evaluating train, since
+    every train pair already has a fold assignment. Test pairs have none, so predicting on
+    them means calling .predict() on saved models directly, averaged across folds (a
+    standard bagging ensemble — every fold's model saw ~80% of train, none of it saw any
+    test data, so there's no leakage risk in using all 5)."""
+    y = df["label"].to_numpy()
+    # .cat.codes, not .to_numpy() directly — the latter decodes every row back into a full
+    # string object again, undoing the memory savings from reading as categorical (only the
+    # integer codes are needed for grouping, not the actual id strings).
+    groups = df["source1_entity_id"].cat.codes.to_numpy()
+    # Build ONE uniform float32 numpy array, column by column, rather than a pandas
+    # DataFrame with each column's own dtype (float32/int32/bool after features.py's
+    # downcast). Two things went wrong with the DataFrame approach at full scale:
+    #   1. df.iloc[tr_idx] on the FULL (28-column, including the two categorical id
+    #      columns) dataframe crashed — pandas' row-take processes every column's block
+    #      regardless of which get selected afterward.
+    #   2. Even after narrowing to just feat_cols, lgb.Dataset()'s *internal* pandas->numpy
+    #      conversion picks a dtype wide enough to safely hold every column's values when
+    #      they're mixed types — which meant float64 (8 bytes), not float32, needing 6.73GB
+    #      for one ~35M-row fold alone (confirmed in the traceback). Handing LightGBM an
+    #      already-uniform float32 array sidesteps that entirely.
+    # Converting one column at a time (not `df[feat_cols].to_numpy(dtype=np.float32)` in one
+    # call) keeps peak memory to "one small column plus the growing output array" instead of
+    # "the full old mixed-dtype block plus the full new array" at once.
+    #
+    # X_all itself is memory-mapped to a temp file, not a plain in-RAM array. Even after
+    # every fix above, X_all (~4.5GB at full train scale) and one fold's ~80% training slice
+    # (~3.4GB) needing to coexist genuinely exceeded available memory — not a bug at that
+    # point, a real resource limit (confirmed clean: the crash was for exactly
+    # rows*cols*4 bytes, no waste left to trim). Per this project's earlier diagnosis (see
+    # experiments.md — the Brave-browser virtual-memory-exhaustion incident), the tighter
+    # constraint on this machine is Windows' virtual memory *commit* limit, not raw physical
+    # RAM: a plain numpy array needs the OS to commit that much anonymous memory up front,
+    # while a memmap backed by a real file needs none of that — pages are read from disk on
+    # demand. Each fold's slice (materialized via fancy indexing on the memmap) still becomes
+    # a normal in-RAM array; only the full-dataset X_all avoids being one.
+    n_rows = len(df)
+    n_feat = len(feat_cols)
+    # The system temp dir (C:) had only ~5.5GB free on this machine — too tight for a
+    # multi-GB memmap file. Default to a caller-supplied directory (main() passes
+    # --artifacts, which lives on D: with tens of GB free) instead of tempfile.gettempdir().
+    memmap_root = memmap_dir if memmap_dir is not None else Path(tempfile.gettempdir())
+    memmap_path = memmap_root / f"train_X_all_{id(df)}.dat"
+    X_all = np.memmap(memmap_path, dtype=np.float32, mode="w+", shape=(n_rows, n_feat))
+    for i, col in enumerate(feat_cols):
+        X_all[:, i] = df[col].to_numpy(dtype=np.float32)
+    X_all.flush()
+
+    oof = np.zeros(len(y), dtype=np.float64)
+    importances = np.zeros(len(feat_cols), dtype=np.float64)
+    models = []
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_all, y, groups)):
+        log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
+            f"(val positives={y[va_idx].sum():,})")
+        # Plain numpy fancy-indexing on an already-uniform float32 array — cheap, no dtype
+        # promotion surprises (unlike pandas .iloc on a mixed-dtype frame; see train_oof's
+        # docstring-adjacent comment above X_all's construction for the full story).
+        X_tr = X_all[tr_idx]
+        X_va = X_all[va_idx]
+        train_set = lgb.Dataset(X_tr, label=y[tr_idx], feature_name=feat_cols)
+        val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set, feature_name=feat_cols)
+        params = dict(lgb_params if lgb_params is not None else LGB_PARAMS, seed=seed + fold)
+        model = lgb.train(
+            params, train_set, num_boost_round=num_boost_round,
+            valid_sets=[val_set],
+            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False), lgb.log_evaluation(0)],
+        )
+        oof[va_idx] = model.predict(X_va, num_iteration=model.best_iteration)
+        importances += model.feature_importance(importance_type="gain")
+        del X_tr, X_va, train_set, val_set
+        gc.collect()
+        models.append(model)
+    del X_all
+    gc.collect()
+    memmap_path.unlink(missing_ok=True)
+    return oof, importances / n_splits, models
+
+
+def save_models(models: list, feat_cols: list, best_threshold: float, model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for i, model in enumerate(models):
+        model.save_model(str(model_dir / f"fold_{i}.txt"), num_iteration=model.best_iteration)
+    meta = {"feature_cols": feat_cols, "best_threshold": best_threshold, "n_folds": len(models)}
+    (model_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"Saved {len(models)} fold models + meta.json to {model_dir}")
+
+
+def apply_exclusivity(df: pd.DataFrame, prob_col: str = "oof_prob") -> pd.DataFrame:
+    """Each candidate goes to its single best-scoring S1 only (confirmed hard rule —
+    0/7,638,365 violations in the real ground truth, see experiments.md)."""
+    idx = df.groupby("candidate_entity_id", observed=True)[prob_col].idxmax()
+    out = df.copy()
+    keep = out.index.isin(set(idx))
+    out.loc[~keep, prob_col] = -1.0  # excluded candidates can never pass any positive threshold
+    return out
+
+
+def predictions_at_threshold(df: pd.DataFrame, all_s1_ids: list, threshold: float, prob_col: str = "oof_prob") -> dict:
+    pred = {s1: set() for s1 in all_s1_ids}
+    passed = df[df[prob_col] > threshold]
+    for s1, group in passed.groupby("source1_entity_id", observed=True):
+        pred[s1] = set(group["candidate_entity_id"])
+    return pred
+
+
+def load_ground_truth_scoped(gt_path: Path, scope: set) -> dict:
+    """Ground truth restricted to `scope`, with singletons (no match, or entirely absent
+    from the GT file's own scope) defaulting to an empty set — needed for a fair macro
+    F0.5: a singleton scores 1.0 for an empty prediction, so it must be represented."""
+    gt = pd.read_csv(gt_path, sep="\t", dtype=str, keep_default_na=False)
+    gt = gt[gt["source1_entity_id"].isin(scope)]
+    truth = {row.source1_entity_id: parse_id_list(row.matched_entity_ids) for row in gt.itertuples()}
+    for s1 in scope:
+        truth.setdefault(s1, set())
+    return truth
+
+
+def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features", required=True)
+    ap.add_argument("--gt", required=True)
+    ap.add_argument("--out-oof", required=True)
+    ap.add_argument("--model-dir", default=None, help="Where to save fold models + meta.json for decide.py.")
+    ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--num-leaves", type=int, default=None, help="Override LGB_PARAMS num_leaves.")
+    ap.add_argument("--learning-rate", type=float, default=None, help="Override LGB_PARAMS learning_rate.")
+    ap.add_argument("--min-data-in-leaf", type=int, default=None, help="Override LGB_PARAMS min_data_in_leaf.")
+    ap.add_argument("--num-boost-round", type=int, default=500)
+    ap.add_argument("--early-stopping-rounds", type=int, default=30)
+    args = ap.parse_args()
+
+    lgb_params = dict(LGB_PARAMS)
+    if args.num_leaves is not None:
+        lgb_params["num_leaves"] = args.num_leaves
+    if args.learning_rate is not None:
+        lgb_params["learning_rate"] = args.learning_rate
+    if args.min_data_in_leaf is not None:
+        lgb_params["min_data_in_leaf"] = args.min_data_in_leaf
+
+    log(f"LGB params: {lgb_params}, num_boost_round={args.num_boost_round}, "
+        f"early_stopping_rounds={args.early_stopping_rounds}")
+    log(f"Loading {args.features}...")
+    df = read_features_parquet(args.features)
+    feat_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
+    log(f"Loaded {len(df):,} pairs, {len(feat_cols)} features, {df['label'].sum():,} positives "
+        f"({df['label'].mean():.2%})")
+
+    memmap_dir = Path(args.out_oof).parent
+    memmap_dir.mkdir(parents=True, exist_ok=True)
+    oof, importances, models = train_oof(
+        df, feat_cols, n_splits=args.folds, memmap_dir=memmap_dir, lgb_params=lgb_params,
+        num_boost_round=args.num_boost_round, early_stopping_rounds=args.early_stopping_rounds,
+    )
+    df["oof_prob"] = oof
+
+    imp = pd.Series(importances, index=feat_cols).sort_values(ascending=False)
+    print("\n===== FEATURE IMPORTANCE (gain, avg over folds) =====")
+    print(imp.to_string())
+
+    df_excl = apply_exclusivity(df)
+    all_s1_ids = df["source1_entity_id"].unique().tolist()
+    truth = load_ground_truth_scoped(Path(args.gt), set(all_s1_ids))
+    log(f"Scoring against ground truth for {len(all_s1_ids):,} S1 entities "
+        f"({sum(1 for v in truth.values() if not v):,} singletons in scope)")
+
+    print("\n===== THRESHOLD SWEEP (OOF macro F0.5, after exclusivity) =====")
+    best = None
+    for thr in np.arange(0.10, 0.95, 0.05):
+        pred = predictions_at_threshold(df_excl, all_s1_ids, thr)
+        scores = score_breakdown(truth, pred)
+        print(f"tau={thr:.2f}  overall={scores['overall']:.4f}  "
+              f"singletons={scores['singletons']:.4f} (n={scores['n_singletons']})  "
+              f"with_matches={scores['with_matches']:.4f} (n={scores['n_with_matches']})")
+        if best is None or scores["overall"] > best[1]["overall"]:
+            best = (thr, scores)
+
+    print(f"\nBest threshold: tau={best[0]:.2f} -> overall OOF macro F0.5 = {best[1]['overall']:.4f}")
+    print(f"  (blocking-recall ceiling applies: this sample's blocking recall caps the "
+          f"achievable score — see experiments.md)")
+
+    if args.model_dir:
+        save_models(models, feat_cols, float(best[0]), Path(args.model_dir))
+
+    out_path = Path(args.out_oof)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df[["source1_entity_id", "candidate_entity_id", "oof_prob", "label"]].to_parquet(out_path, index=False)
+    log(f"Wrote OOF predictions to {out_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,724 @@
+# Experiments log
+
+## Plan revision decision (25 Sep, Day 1, post-EDA)
+Reviewed the original plan against the EDA numbers below and revised it — full rationale in the plan file's "Revision after Day 1 EDA" section, mirrored in `CLAUDE.md` and `PROJECT_OVERVIEW.md` §0/§7/timeline. Summary: architecture unchanged; blocking reordered so Day 1 uses chunked sparse TF-IDF only (country as a hard filter) and embeddings+FAISS move to Day 2 as a background job (GPU embedding pass over ~24M strings is too slow to gate today's submission on); exclusivity is now enforced as a hard rule in the decision step (confirmed 0 violations); candidate K starts lower (~15); LightGBM training needs negative downsampling given the pair volume at this scale.
+
+## Dataset scale (measured 25 Sep, Day 1)
+- Train: S1 2,206,821 rows | S2 5,034,617 | S3 5,285,604 | ground truth 2,206,822 rows. Train dir ~1.3 GB.
+- Test: S1 1,732,545 | S2 4,887,274 | S3 5,082,317. Test dir ~1.2 GB.
+- Train S1 country split: US 1,323,633 (60.0%) / India 883,188 (40.0%).
+- This is ~5x bigger than the "1M records" placeholder used in the original plan — blocking, chunking and per-country processing are not optional, they're required for this to run on the dev machine (15.4 GB RAM).
+- EDA run took several minutes on full data (background job). Ran into two bugs at this scale, both fixed in `src/eda.py`: (1) naive Python loops over millions of ground-truth pairs caused a silent kill/segfault — rewrote with vectorized pandas (`explode`, `.map`, `.value_counts`) instead of per-row `.get()` calls; (2) re-reading train files twice (once for stats, once for GT analysis) pushed memory too far — now reads each file exactly once and reuses it; (3) Windows console is cp1252 by default and crashed printing non-ASCII sample text — forced UTF-8 stdout.
+
+### Ground-truth findings (train, confirmed 25 Sep)
+- **Singleton rate: 5.58%** (123,247 / 2,206,821 S1 entities have zero matches). Much lower than we should have assumed going in — most S1 businesses (94.4%) have at least one real match. Consistent across country: US 5.58%, India 5.59%.
+- **Matches per S1 is NOT mostly 0/1** — it's concentrated at 2-5, roughly bell-shaped: {0: 123,247 | 1: 119,157 | 2: 375,212 | 3: 530,841 (mode) | 4: 484,115 | 5: 321,957 | 6: 164,868 | 7: 63,968 | 8: 18,680 | 9: 4,205 | 10: 534 | 11: 37}. Design implication: the "predict empty for singletons" case matters (5.6% of macro-F0.5 rows), but the bulk of the score comes from getting 2-5-way match sets right — recall on the FULL set matters more than we initially weighted it.
+- **Exclusivity assumption CONFIRMED, perfectly**: 0 / 7,638,365 matched S2/S3 IDs are matched to more than one S1. This validates the plan's exclusivity step (assign each S2/S3 ID to its single best-scoring S1 only) — safe to enforce as a hard constraint, not just a soft filter.
+- 7,638,365 total ground-truth pairs: 3,693,619 from S2, 3,944,746 from S3 (close to even).
+- 73.36% of S2 records and 74.63% of S3 records have *some* S1 match; the rest (~25-27%) are true non-matches (noise/unrelated records) that must be correctly excluded — this is where precision is won or lost.
+- **Country agreement: 100.00%** of matched pairs share the same country label. Blocking can safely restrict candidate search to the same country — this cuts the candidate search space by ~2-3x for free and is a strong precision signal. (Caveat: this is measured on train, which only has US/India; assuming it also holds between France test records and their true source — reasonable given the data design, but keep an eye on it since we can't verify directly on test.)
+- business_address is empty for ~3.3% of S2/S3 records (never empty in S1) — normalization must handle missing addresses gracefully, matching on name alone in that case.
+
+### Noise patterns observed in real sample matches (see `artifacts/eda_full_output_day1.txt` for the full 15-example dump)
+- **Transliteration is real and severe**, not just theoretical: `Hotel Enterprises Limited` ↔ `होटल एंटरप्राइजेज लिमिटेड` (Devanagari) — same business, same address, no shared characters at all. Character n-gram / edit-distance features are useless here; we need the multilingual embedding retriever in blocking or these are simply unrecoverable.
+- **Word-level corruption**: `Maure Williams` → `Maure Wilblims`, `Crystal Staffing` → `Crystal Sttfrifng`, `Warwick` → `Warwik` — classic typo/OCR-style noise, well suited to fuzzy ratio + Levenshtein.
+- **Word reordering**: `Orellana Investments LLC` → `LLC Orellana Invsmbens`; `Crystal Staffing Solutions LLC` → `LLC Crystal Sttfrifng Solutions` — token_sort_ratio / token_set_ratio needed, plain `ratio()` will underscore these.
+- **Junk/placeholder tokens in address**: literal `<NULL>` string appears in-line in an address (`939389287`). Normalization should strip known placeholder tokens (`<NULL>`, `N/A`, `NONE`, `-`) rather than treating them as content.
+- **Bracket/marker noise around legal suffix**: `Obsidian, [[LLC]]`, `[Corp] Dick Regional Armada` — suffix detection regex needs to tolerate surrounding brackets/punctuation.
+- **DBA (trade name) records**: `Korbrixx D.B.A. Obsidian, LLC` matches `Obsidian, LLC` — the DBA prefix needs to be either stripped or treated as a separate high-value feature ("does one name contain the other after suffix stripping").
+- **Phone numbers embedded directly in the name field**: `Chordia + Pagnters - 7306204978` — names aren't clean; strip trailing numeric/phone-like tokens before name comparison, but don't discard them as a feature (a shared phone number substring would be a very strong signal if it recurs).
+- **Missing address is common on the noisy sources**: several S2/S3 examples above have a blank address and only the name to go on (consistent with the 3.3% empty-address stat) — name-only matching path is not a rare edge case, it's routine.
+- Confirms the plan's Stage 1/2 design (accent/script-aware embeddings, abbreviation expansion, suffix isolation, token-set fuzzy matching) is the right shape; adds concrete cleanup rules to implement: strip placeholder tokens, tolerate bracket noise around suffixes, strip/feature-ize embedded phone numbers.
+
+## Blocking (src/blocking.py) — final Day 1 design and results (25 Sep, Day 1)
+
+**Final approach**: country-scoped (hard filter) inverted-index token blocking, built as plain
+Python dicts (`{key: [candidate_ids]}`), not a pandas DataFrame join. Three key types per
+record: adjacent-word bigrams (`B:tok1_tok2`, most selective — naturally much rarer than either
+constituent word), single word tokens (`W:tok`, fallback), postal code (`P:code`, exact). Each S1
+uses only its own top-3 rarest keys (by candidate-side document frequency) plus postal code if
+present — never every token — so every record contributes a small, bounded, maximally-selective
+key set regardless of corpus size. Candidates are scored by an IDF-weighted sum (`1/df` per shared
+key, postal code weighted at a flat 5.0) and the top-20 per S1 are kept.
+
+**Debugging arc (each of these was a real bug confirmed on real data, not just tuning)**:
+1. A flat `max_df=2000` cutoff dropped **every** key for names built from moderately-common
+   words (`shree traders`, `federal united group`, `bay holdings group`) — even exact string
+   matches got zero candidates. Root cause: at 5-10M-record scale, even fairly distinctive words
+   ("twisted"=8,783 occurrences, "packaging"=6,402) blow past any low absolute cutoff; 62.5% of
+   all word-key postings mass sat in just 867 of ~1M unique keys. Fixed by switching from "drop
+   globally common keys" to "each S1 keeps its own rarest available keys" — recall 27%→39%.
+2. Loosening `max_df` to fix that broke runtime: total join work scales with `sum(df)` over
+   every key actually used, and moderately-common keys are still expensive in aggregate even
+   under per-record selection. A `pandas.merge()`-based join of the full candidate index against
+   even one small (~2,031-row) S1 batch produced a 77.8M-row intermediate and crashed on memory.
+3. Added S1-side batching (bounds peak memory) and word-bigram keys (naturally far rarer than
+   unigrams, so preferred automatically by the existing rarest-key selection) — recall →56.5%,
+   zero-candidate exact-match failures →0.
+4. Even with bigrams, the `pandas.merge()` architecture itself measured **~40+ hours extrapolated
+   to the full 2.2M-row train set** — completely infeasible, because a DataFrame join
+   materializes the full matched-row set for every batch regardless of how selective the
+   individual keys are. **Fix: replaced the join with direct Python dict lookups** — build
+   `{key: [candidate_ids]}` once per country, look up each S1's 2-4 selected keys directly,
+   accumulate IDF-weighted scores in a plain dict. This is the same logical computation with
+   none of the DataFrame materialization overhead.
+5. Profiling the dict-index build itself found `groupby(...).apply(list)` spending ~56 of ~94s
+   on just India due to pandas' per-group Python-call overhead across 2.3M groups — replaced
+   with numpy `sort_values` + `np.unique(..., return_index=True)` + one bulk `.tolist()` call
+   (not one per group) to slice group boundaries out of a single Python list.
+
+**Measured results (train, India+US, 50,000-S1 sample — consistent with a 5,000-S1 sample too,
+so numbers are stable, not sampling noise)**:
+- Recall: 56.24% (97,217 / 172,874 ground-truth pairs found)
+- Zero-candidate S1s (had a true match, got no candidates at all): 0 / 47,139
+- Avg candidates per S1: 19.7 (near the K=20 cap)
+- Runtime: India 254.6s / 20,004 rows, US 297.4s / 29,996 rows → **full train extrapolates to
+  ~4.4 hours** (down from ~40+ hours with the pandas-merge version — ~9x improvement)
+
+**This is a Day 1, single-retriever number, not the final target.** The plan's design is a union
+of retrievers; Day 2's embedding+FAISS retriever is specifically meant to catch what token
+blocking structurally cannot (transliteration — confirmed necessary: `होटल एंटरप्राइजेज लिमिटेड`
+shares zero characters with its Latin-script match — and heavy typos). 56% recall from the cheap
+first pass alone is a reasonable Day 1 checkpoint.
+
+**Full-train run**: first launch (~15:56) crashed with `MemoryError` ~2 min in — caused by running
+`features.py`/`train.py` concurrently with it (15:58-16:03) for Stage 3 development, exactly the
+resource-contention risk flagged earlier but then triggered anyway to make parallel progress.
+That trade paid off (got the validated 0.6632 OOF result on the 50k sample) but cost the run.
+**Relaunched cleanly at 16:07 with no concurrent heavy jobs** — but crashed again at 18:19, this
+time with `pyarrow.lib.ArrowMemoryError: malloc of size 1073741824 failed` while reading a
+~272MB source1 parquet. Nothing on our side was running concurrently at that point (confirmed no
+other Python processes) — this was external memory pressure elsewhere on the machine, not a bug
+in our code. Memory was back to 5.3GB free 11 minutes later. **Relaunched a third time at
+18:30**, ~4.4h ETA (~22:50 IST), writing to `artifacts/candidate_pairs_train_full.tsv`. The
+50k-sample snapshot used for Stage 3 development is saved at
+`artifacts/candidate_pairs_train_sample50k.tsv`.
+Lesson: on a 15.4GB shared machine, an unattended multi-hour job can be taken out by memory
+pressure we don't control, not just by our own bugs — worth checking `ps` / free RAM on any
+unexpected crash before assuming the code is at fault.
+
+**Attempt 3 (18:30) crashed again, immediately** — same error, same place. At that point 5.37GB
+was free (not obviously insufficient), with Brave browser using ~4GB across many processes —
+this smells like a Windows virtual-memory commit-limit issue (total reserved virtual memory
+across all processes vs. physical RAM + pagefile) rather than a simple "not enough free RAM"
+situation, which free-RAM alone doesn't show.
+
+**Real fix applied regardless of root cause**: `load_normalized_trimmed()` in blocking.py was
+calling `pd.read_parquet(cache_path)` with no column selection, loading **all 12 columns**
+(including the full raw `business_name`/`business_address` text — the bulk of each file's size)
+only to immediately select down to the 4 columns blocking actually needs and discard the rest.
+Fixed via parquet column pushdown (`normalize_and_cache(..., columns=BLOCKING_COLS)`), so unused
+columns are never read into memory at all. This is a real, general inefficiency worth having
+fixed regardless of whether it was the proximate cause of these crashes — every future full-scale
+read now uses meaningfully less peak memory.
+**Attempt 4 launched 18:32** with the fix in place — crashed again 11s later, same allocation-failure
+pattern but now inside `build_keys`'s bigram explode step, on a tiny 46.2MB allocation.
+
+**Real root cause found**: checked Windows virtual memory directly (`Get-CimInstance
+Win32_OperatingSystem`), not just physical RAM. `FreeVirtualMemory` was ~4.16GB — *lower* than
+free physical RAM (5.19GB) — because the pagefile is small (~5.3GB, auto-managed) and total
+system commit was near its ceiling, driven by the Brave browser's many processes reserving large
+amounts of virtual address space. This is a Windows virtual-memory-commit-limit problem, not a
+bug in the pipeline: every prior crash (40MB, 496MB, 1GB, 46MB, all different code paths) was
+the same underlying cause at different, essentially random trigger points. **Free RAM alone was
+not a reliable signal for whether an allocation would succeed on this machine** — worth checking
+`FreeVirtualMemory` specifically, not just `FreePhysicalMemory`, on any further unexplained crash.
+
+User closed/reduced Brave; `FreeVirtualMemory` rose to 9.43GB. **Attempt 5 launched 20:12.**
+
+**Attempt 5 progress**: India completed successfully — **17,522,668 candidate pairs**. Wall-clock
+showed 43,397.6s (~12h) but `Get-Process`'s cumulative CPU-time check showed only ~3h54m of real
+CPU work across the whole run to that point — confirms the wall-clock inflation is genuinely from
+the laptop sleeping (Windows suspends processes cleanly; time.time() elapsed still counts the
+suspended duration), not a real slowdown. Requested `keep_awake` (session_idle) partway through
+to make later readings trustworter — but that tool explicitly does NOT prevent lid-close or
+manual sleep, only idle timeout, so wall-clock readings for the rest of this run are still not
+fully trustworthy without the user manually keeping the lid open / disabling lid-close sleep.
+
+**Attempt 5 then crashed during the US phase** with a plain `MemoryError` (not an allocation-size
+message this time) inside `_score_s1_batch`'s per-entity score accumulation loop — after ~15h
+wall-clock (~3h54m+ CPU time by that point). Root cause: with `top_r_tokens=3` word/bigram keys
+plus a possible postal key, and each key capped at `max_df=50,000` postings, one entity's
+`scores` accumulator dict could in the worst case (near-zero overlap between the four keys'
+postings) reach ~4×50,000 = 200,000 entries — rare enough not to appear in 5k/50k-row samples,
+real at 2.2M rows.
+
+**Compounding problem this crash exposed**: the run had **no checkpointing** — a crash during the
+US phase meant India's already-completed 17.5M pairs would have to be recomputed from scratch on
+retry, at the cost of redoing ~2h of real compute (plus whatever wall-clock/sleep inflation).
+
+**Two fixes applied**:
+1. A cap (`MAX_SCORES_PER_ENTITY = 100_000`) on the per-entity accumulator: once an entity's own
+   `scores` dict reaches this size it already has far more candidates than the top-k it needs, so
+   further keys are skipped for that entity rather than let the dict grow unbounded.
+2. **Per-country checkpointing** in `compute_candidates()`: each country's result is saved to
+   `artifacts/blocking_checkpoints_{split}/_country_{country}.parquet` immediately after
+   computing, and loaded from there instead of recomputed on a later run. Only applies to full
+   (non-`--sample-s1`) runs, to avoid a stale sampled checkpoint being mistaken for a full one.
+
+**Considered but explicitly declined**: parallelizing the blocking join across CPU cores via
+`multiprocessing` to cut real compute time. Windows' `multiprocessing` uses `spawn`, not `fork` —
+each worker would need its own full copy of the (potentially multi-GB) postings dict rather than
+sharing one via copy-on-write, which risks reintroducing the exact memory crashes just fixed for
+an unproven speed win. Not worth the risk under time pressure; worth reconsidering later with a
+proper shared-memory design if blocking needs to be rerun many more times.
+
+**Attempt 6 launched 11:50** (no checkpoint existed yet from attempt 5, so India recomputes once
+more; from now on a crash won't lose a completed country's work).
+
+## Full-train blocking: SUCCESS (26 Sep, attempt 6)
+
+Both countries completed and checkpointed:
+- India: 17,522,668 pairs (20,213.2s wall-clock this attempt)
+- US: 25,878,257 pairs (8,873.1s wall-clock)
+- **Total: 43,400,925 candidate pairs**, written to `artifacts/candidate_pairs_train_full.tsv`
+  (2,206,821 rows — full S1 coverage) and `artifacts/candidate_scores_train.parquet` (with score
+  + rank, for feature engineering).
+
+`measure_recall` then crashed with `MemoryError` — but only in the diagnostic step, *after* both
+output files were already safely written. Root cause: its pandas two-column merge (43.4M
+candidate pairs x 7.6M ground-truth pairs) needed more memory than was available for the
+internal join factorization. Fixed the same way as normalize.py's earlier bugs — avoid heavy
+string-object structures at this row count. First fix attempt (string-concat + Python set) also
+crashed; the working fix encodes both id columns to compact int64 codes (shared factorization
+across both frames) and compares with `numpy.isin` — dense integer arrays instead of strings/
+tuples/sets, dramatically lighter at this scale.
+
+**Real full-scale recall: 56.10%** (4,285,280 / 7,638,365) — matches the 50k-sample estimate
+(56.24%) almost exactly, confirming the sample-based calibration was representative all along.
+Only 55 / 2,083,574 S1s with a true match got zero candidates (0.0026%) — negligible, consistent
+with the sample's "0 zero-candidate failures" finding at a scale where a handful of edge cases
+are expected.
+
+**CPU-time monitoring during this run** (via `Get-Process`, not wall-clock) showed real,
+observable variance in utilization: some windows near 100% CPU (steady progress), one ~1h
+stretch at only ~6% (likely sleep or memory-pressure thrashing) — confirms `time.time()`-based
+elapsed logging in these scripts still isn't a reliable duration signal on this machine; only
+`Get-Process`'s cumulative CPU time is.
+
+**Next**: run `features.py` on the full 43.4M-pair set, retrain `train.py` (now saves models via
+`--model-dir`, see the `decide.py` addition below) to get a real full-scale OOF score, then move
+to test-set blocking.
+
+## Full train_oof memory debugging arc, then strategy pivot (26 Sep)
+
+Training LightGBM on all 43.4M rows hit a long chain of full-scale-only memory issues, each
+fixed in turn (see the commit history for exact details): mixed-dtype feature columns forcing
+float64 upcasts inside both pandas and LightGBM's internal conversion, `df.iloc[]` on the full
+28-column frame dragging id columns along unnecessarily, a fold's ~35M-row training slice and
+the full 43.4M-row X_all needing to coexist in memory. The dtype fix (float32/int32/int8
+throughout) and building X_all as one column-by-column-constructed array were real, confirmed
+improvements — each got the crash further before the next bottleneck appeared, and each was
+verified byte-for-byte / value-identical against the known-good 50k-sample result before being
+trusted at scale.
+
+The X_all-vs-fold-slice memory conflict was fixed by backing X_all with a memory-mapped file
+(consistent with this project's earlier diagnosis that Windows' virtual-memory *commit limit*,
+not physical RAM, is the tighter constraint on this machine) — but this then hit a **native
+access violation inside LightGBM's C library** (`LGBM_DatasetCreateFromMat`), not a catchable
+Python `MemoryError`. This is a different class of problem: LightGBM's low-level array handling
+doesn't appear to interact safely with memmap-backed numpy arrays on Windows, and debugging a
+native crash inside a compiled C extension is a much larger, less certain time investment than
+the pure-Python memory fixes so far.
+
+**Decision: stop pushing full 43.4M-row training through this machine, train on a large
+subsample instead.** Full-scale blocking (43.4M pairs, 56.1% recall) and full-scale feature
+computation (894MB parquet, correct/verified) both already succeeded — that work isn't wasted.
+`sample_features.py` (new) samples ~400-500k S1 entities' worth of rows directly from the
+already-computed `features_train_full.parquet` via pyarrow predicate pushdown (never loads the
+full file), giving ~8-10M pairs — comfortably within memory territory already proven reliable
+(the 50k sample's ~983k pairs trained without issue), while being a substantially larger and
+more representative training set than the original 50k-S1 development sample.
+
+## First complete, valid submission produced (26-27 Sep, overnight)
+
+Picked back up the pivot plan from the previous entry and ran it through to completion:
+
+1. **`sample_features.py`**: sampled 500,000 S1 entities (~9.8M pairs) from the full train
+   features — took ~12s (predicate pushdown, never touches the full 43.4M-row file).
+2. **Trained on the 500k sample**: OOF macro F0.5 = **0.6636** at τ=0.50 (consistent with the
+   50k sample's 0.6631, now on 10x the data). 5 fold models saved to `artifacts/models_full/`.
+3. **Full test-set blocking**: ran cleanly end to end this time (one transient crash on the
+   France→India transition, same known `explode()` memory-pressure pattern, fixed by a plain
+   retry — France's checkpoint was reused, no recomputation). Final numbers:
+   - France: 5,067,199 pairs (34m)
+   - India: 16,090,796 pairs (2h40m)
+   - US: 12,839,502 pairs (41m — faster than estimated)
+   - **Total: 33,997,497 candidate pairs, full coverage of all 1,732,544 test S1 entities**
+   - Total wall-clock: ~3h23m — close to the ~3.5-4h estimate, no sleep-inflation this run.
+4. **Test features**: 33,997,497 rows computed in ~10.5 min, no crash (all the batching/dtype
+   fixes from the train run held up at test scale too).
+5. **`decide.py`**: applied the 500k-sample model ensemble, enforced exclusivity, threshold
+   τ=0.50 (from training) → `output/matching_results.tsv` (1,732,544 rows: 1,271,476 with a
+   match, 461,068 predicted singletons) + `output/candidate_pairs.tsv` (copied through).
+6. **`utils/validate_submission.py --check-ids`: PASS.** Every ID in both files genuinely
+   exists in the test set; no format violations.
+
+**Honest read on the singleton rate**: 461,068/1,732,544 ≈ 26.6% predicted singletons, far
+above train's true ~5.6% singleton rate. This is expected given blocking recall (~56%) — many
+entities with real matches simply have no candidate clearing threshold, so the model defaults
+them to "no match." Not a bug, just the recall ceiling showing up directly in the submission;
+the private-leaderboard score will very likely reflect that ceiling until Day 2 embeddings
+improve recall.
+
+**Status: a complete, valid, submission-ready file exists at `output/matching_results.tsv` /
+`output/candidate_pairs.tsv`.** Uploading to the actual portal is the user's own action.
+
+## First real leaderboard score: public LB F0.5 = 0.658 (27 Sep morning)
+
+Uploaded the file above. **Public LB F0.5 = 0.658**, vs. OOF 0.6636 — only ~0.6% apart,
+confirming the GroupKFold + exact-metric threshold sweep is well-calibrated, not overfit to
+the training sample. Logged in `submissions.md`.
+
+## Exact-name-match supplementary blocking pass (27 Sep)
+
+Investigated real recall-miss cases (S1 entities whose true match is missing from candidates)
+by inspecting 20 actual examples rather than theorizing. Found a genuinely mixed bag:
+roughly a third were **fixable blocking-logic gaps**, not cases needing semantic embeddings —
+word reordering breaking bigram overlap (`orthopedic safe health` vs `orthopedic health safe`,
+zero shared bigrams despite identical words) and, more strikingly, **exact string matches still
+missing** (`krishna power` -> `krishna power`, `united agro` -> `united agro` — identical
+strings, dropped because the phrase is common enough to exceed even the rarest-token
+selection's effective reach). Full multilingual embeddings were separately sized at ~12.6h of
+CPU compute for the whole dataset — infeasible on the last day — so this cheaper, evidence-based
+fix was pursued first.
+
+**`exact_match_candidates.py`** (new): for each country, merge S1 and S2/S3 records on exact
+`name_core` — vectorized per-country merge, not a Python loop over groups (would have repeated
+blocking.py's original mistake). First uncapped run on train produced **75.2M pairs** — nearly
+double the entire existing candidate set — because a handful of very generic/short names
+(median group size 4, but max 1,359) dominate the count. Added `max_group_size=50` (mirrors
+blocking.py's `max_df`, just for whole-name groups instead of tokens): cut train to **6.1M pairs**
+(India 1.75M, US 4.35M), test to **5.0M pairs** (France 1.26M, India 1.64M, US 2.07M).
+
+**`merge_candidates.py`** (new): unions blocking.py's token/bigram candidates with the
+exact-match candidates, working entirely from flat parquet sources
+(`candidate_scores_{split}.parquet`, never the comma-joined TSV — re-exploding that at full
+scale crashed with MemoryError more than once already this project).
+
+**Measured recall gain on train: 56.10% -> 57.75% (+1.65pp)**, from combined pairs
+43.4M -> 44.46M (most exact-match pairs already existed in the token/bigram set).
+
+**Retrained on a fresh 500k-S1 sample of the merged candidates: OOF macro F0.5 = 0.6762 at
+τ=0.55** (up from 0.6636 at τ=0.50) — a genuine, real improvement matching the recall gain, not
+noise. Models saved to `artifacts/models_merged/`.
+
+Regenerated test predictions (`decide.py` with the new model + merged test candidates):
+1,732,544 rows, 451,981 predicted singletons (down from 461,068), 1,280,563 with a match (up
+from 1,271,476). **`utils/validate_submission.py --check-ids`: PASS.** New
+`output/matching_results.tsv` is ready — a second, improved submission, not yet uploaded.
+
+## Sorted-token (reorder-tolerant) supplementary pass — a second cheap win (27 Sep)
+
+User asked to keep improving before uploading again. Generalized `exact_match_candidates.py`
+to accept a `--key-mode`: `exact` (raw core name, already built) or `sorted` (name_core with
+its words alphabetically sorted — "orthopedic safe health" and "orthopedic health safe" both
+become "health orthopedic safe"). This directly targets the word-reordering recall-miss
+category identified earlier: adjacent-word bigrams have zero overlap when word order differs,
+even if every word matches. Same vectorized per-country merge + `max_group_size=50` cap as the
+exact-match pass, no new engineering risk.
+
+- Train: France n/a, India 1.80M, US 4.60M -> **6.40M sorted-match pairs**
+- Test: France 1.32M, India 1.69M, US 2.19M -> **5.20M sorted-match pairs**
+
+**Measured incremental recall gain on train**: bigram-only 56.10% -> +exact 57.75% ->
+**+sorted 59.02%** (+1.27pp on top of exact-match, +2.92pp total over baseline). Confirms the
+reordering hypothesis was real, not a one-off from the 20-case sample.
+
+Generalized `merge_candidates.py` to take a `--extra-modes` list (default `exact sorted`)
+instead of hardcoding two sources, so adding a third pass didn't require new merge logic.
+
+**Retrained on a fresh 500k-S1 sample of the triple-merged candidates: OOF macro F0.5 = 0.6840
+at τ=0.55** — up from 0.6762 (exact-match only) and 0.6636 (baseline). Total progression:
+**0.6636 -> 0.6762 -> 0.6840**, a genuine +3.1% relative improvement, entirely from cheap
+(minutes-scale) supplementary blocking passes — no multi-hour embedding compute needed.
+
+Regenerated test predictions: 1,732,544 rows, 446,070 predicted singletons (down again from
+451,981), 1,286,474 with a match. **`utils/validate_submission.py --check-ids`: PASS.**
+`output/matching_results.tsv` now holds this third, further-improved version — not yet
+uploaded (public LB currently only reflects the first submission, 0.658, from the baseline
+model before either supplementary pass).
+
+## Theoretical ceiling check + "more data" test (27 Sep)
+
+User asked whether something substantial could push the score above 0.8. Worked out the
+ceiling a theoretically *perfect* classifier could reach on our current candidates (59%
+blocking recall, 5.6% singleton rate): entities with matches get precision=1.0 (only true
+positives ever selected) and ~59% recall -> F0.5≈0.878 each; singletons get 1.0. Weighted
+average: **~0.885 ceiling**. We're at 0.684 — a large gap below that ceiling, meaning the
+bottleneck right now is **classifier/feature quality, not blocking recall**. The
+originally-planned "context/rank features" (candidate rank within its S1's shortlist,
+reverse-rank, score gap to the best candidate — flagged in the plan as "usually the strongest
+feature group") were never actually implemented in `features.py`. That's the concrete gap.
+
+**Tested "train on more data" as a lower-risk lever first** (500k -> 1M S1, ~20.3M rows,
+~38 min, no crash — confirms memmap-based training is reliable well past 500k, just not
+tested at the full 2.2M/43M-row scale that crashed originally). **Result: OOF F0.5 0.6840 ->
+0.6848 — only +0.0008, essentially noise.** Real, useful finding: data volume is NOT the
+bottleneck at the current feature set; the model was already data-sufficient at 500k. This
+sharpens the priority — rank/context features are the higher-payoff lever to pursue next, not
+further scaling the training sample.
+
+## Rank/context features added (27 Sep) — the previously-planned, never-built feature group
+
+Implemented `add_rank_features.py`: a post-process pass over an existing features parquet
+(rather than rebuilding features.py from scratch) that adds 7 new columns per (S1, candidate)
+pair, using a cheap heuristic proxy score (0.7×name_token_set + 0.3×addr_token_set, falling
+back to name-only when either address is empty) purely to rank candidates — the raw
+similarity features remain available separately for the model:
+- `f_rank_in_s1` / `f_reverse_rank_in_s1` / `f_group_size_s1` / `f_score_gap_to_best_in_s1`:
+  this candidate's rank (and gap to the best) among all candidates competing for the same S1.
+- `f_rank_for_cand` / `f_group_size_cand` / `f_score_gap_to_best_for_cand`: the reverse
+  direction — this S1's rank (and gap to the best) among all S1s competing for the same
+  candidate. Directly relevant to the exclusivity rule (each candidate goes to only one S1).
+
+Implementation note: computing this needs a global groupby/rank over the whole candidate set,
+which doesn't fit features.py's per-batch streaming design. Kept memory bounded by
+factorizing the two ID columns to int32 codes and dropping the raw strings immediately (each
+one costs several GB at 35-45M rows otherwise — the same pattern that caused MemoryErrors
+earlier in this project), doing the actual rank computation with numpy (bincount +
+searchsorted for group boundaries, one lexsort) instead of pandas groupby, and streaming the
+final rewrite back onto the original file via `pyarrow.iter_batches` + `ParquetWriter`. Ran in
+under 2 minutes at full scale on both splits (train: 44,734,891 rows / 2,206,776 S1s; test:
+35,162,542 rows / 1,732,492 S1s) — negligible cost next to the hours blocking.py and
+features.py took.
+
+**Result on the same 500k-S1 sample used for the 0.6840 baseline: OOF F0.5 0.6840 -> 0.6903
+(+0.0063, tau=0.60).** A real, meaningful gain — about 8x the +0.0008 the 1M-data test gave,
+though still smaller than the two blocking-fix passes (+0.0126, +0.0078). LightGBM's split-gain
+importances confirm the new features carry real signal: `f_score_gap_to_best_for_cand` ranks
+**3rd overall** by total gain (6.33e8, behind only f_name_len_a and f_name_ratio), and
+`f_rank_for_cand` ranks 7th (1.57e8). Notably the **reverse-direction** (per-candidate) rank
+features dominate — the forward-direction (per-S1) ones (`f_rank_in_s1`,
+`f_reverse_rank_in_s1`, `f_group_size_s1`, `f_score_gap_to_best_in_s1`) rank much lower
+(roughly 590k-7.9M gain, near the bottom of the 28-feature list). Plausible reason: exclusivity
+is enforced downstream in decide.py regardless, so what the model most needs from the rank
+features is "is some OTHER S1 a stronger claimant for this same candidate?" — exactly what the
+per-candidate features encode — rather than its own S1's shortlist shape.
+
+Progression so far, same metric, comparable sample size: 0.6636 -> 0.6762 -> 0.6840 -> 0.6903
+(baseline -> exact-match -> sorted-token -> rank/context), a cumulative +0.0267 (+4.0%
+relative). Regenerated and validated test predictions with the merged3 model (models_merged3_500k)
++ merged2 test candidates — `utils/validate_submission.py --check-ids` PASSes. Ready as a
+fourth submission candidate; not yet uploaded.
+
+## LightGBM hyperparameter tuning (27 Sep)
+
+Added CLI overrides to `train.py` (`--num-leaves`, `--learning-rate`, `--min-data-in-leaf`,
+`--num-boost-round`, `--early-stopping-rounds`) instead of hardcoding a new script — the
+existing LGB_PARAMS (num_leaves=31, min_data_in_leaf=50, learning_rate=0.05) had never been
+tuned. Reasoning for the first variant tried: 500k S1 -> ~10.1M rows is a lot of data for
+31-leaf trees to only lightly use; tried num_leaves=63, min_data_in_leaf=30 (loosened to let
+the bigger trees actually split that far), learning_rate=0.04 (slightly lower to compensate
+for the higher-variance deeper trees, with early stopping already in place to control rounds).
+
+**Result: OOF F0.5 0.6903 -> 0.6916 (+0.0013)** on the same rank-features 500k sample. Small
+but real and in the expected direction. Diminishing-returns pattern similar to the 1M-data
+test, suggesting hyperparameters were already reasonably close to good for this feature set —
+unlike the rank/context features, which added genuinely new information, tuning here is
+squeezing marginal gains out of information the model already had access to.
+
+Regenerated and validated test predictions using this tuned model (models_merged3_tuned1) —
+fifth submission candidate, OOF 0.6916, not yet uploaded. Running progression: 0.6636 ->
+0.6762 -> 0.6840 -> 0.6903 -> 0.6916 (cumulative +0.0280, +4.2% relative over the original
+baseline).
+
+## Squashed-name (nospace) blocking pass (27 Sep) — biggest single recall gain so far
+
+Rather than guess at the next fix, wrote `diagnose_recall_misses.py`: samples real
+ground-truth pairs the current candidate set (blocking + exact + sorted) still misses, with
+actual name/address text side by side, using the same integer-encoded comparison pattern as
+`measure_recall`. 40 real misses inspected fell into a few clear buckets: (1) one side's name
+run together with no spaces, sometimes with a trailing domain-like word — 'creative systems'
+vs 'creativesystems com', 'shalom network' vs 'shalomnetwork', 'roman animal hospital' vs
+'romananimalhospital com' — distinct from reordering since one side is a single token and
+sorting it changes nothing; (2) Devanagari/Bengali/Kannada transliteration (genuinely hard
+without embeddings); (3) real typos (needs fuzzy/edit-distance blocking, not exact-key); (4)
+a handful of literally-identical names ('northwind', 'viis', 'family specialists') apparently
+still dropped by the exact-match pass's `max_group_size=50` genericity cap — a separate,
+not-yet-investigated issue.
+
+Targeted bucket (1): added a `nospace` key_mode to `exact_match_candidates.py` — squashes all
+whitespace out of `name_core` after dropping one trailing domain-suffix word (com/in/org/net/
+co/biz/info) if present, same country-scoped/capped structure as exact/sorted. **Measured
+recall gain: 59.02% -> 61.47%, +2.45pp** — the biggest single supplementary-pass gain so far,
+bigger than exact (+1.65pp) and sorted (+1.27pp) individually.
+
+Hit a real memory bug measuring this: the first gain-measurement script did `pd.concat` +
+`drop_duplicates()` on ~62M raw string-ID rows across 4 parquet files and thrashed for 10+
+minutes under low free-virtual-memory (same class of problem as several earlier crashes in
+this project) before being killed and rewritten with integer-encoded factorization — finished
+in under 4 minutes once fixed. Applied the same lesson when regenerating features: reused
+`features.py`'s existing `load_candidate_pairs()` (explodes the comma-joined
+candidate_pairs.tsv) crashed outright with `ArrayMemoryError` at the new 45.2M-pair merged
+scale — added `load_candidate_pairs_from_sources()` (new `--extra-modes` CLI arg) which builds
+the pairs frame directly from the flat per-mode parquets instead, deduping via integer keys
+instead of `drop_duplicates()` on strings. Full recompute went cleanly after that fix:
+- `features_train_merged4.parquet`: 45,185,457 rows, 4,695,401 positives (10.39%) — matches
+  the 61.47% recall measurement exactly. ~15 min full-scale (train candidate pairs 45.2M).
+- `features_test_merged4.parquet`: regenerating next (candidate pairs 35,475,094).
+
+Ran `add_rank_features.py` on both full-scale merged4 files -> `features_{split}_merged5.parquet`
+(train: 45,185,457 rows; test: 35,475,094 rows), resampled 500k S1 from train, retrained with
+the same tuned hyperparameters (num_leaves=63, min_data_in_leaf=30, learning_rate=0.04).
+
+**Result: OOF macro F0.5 0.6916 -> 0.7059 (+0.0143, tau=0.60)** — the biggest single gain of
+the night, confirming the +2.45pp recall improvement from the nospace pass translated directly
+into classifier quality, not just more (mostly-negative) candidates for the model to reject.
+First time crossing 0.70. Regenerated and validated test predictions
+(`utils/validate_submission.py --check-ids`: PASS) — 1,297,775 / 1,732,544 test entities
+predicted with at least one match, 434,769 singletons. Sent to the user as the current best
+submission candidate; not yet uploaded to the leaderboard.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> **0.7059**
+(baseline -> exact-match -> sorted-token -> rank/context -> hyperparameter tuning -> nospace).
+Cumulative +0.0423 (+6.4% relative) over the first real submission. Blocking recall over the
+same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) -> 61.47%.
+
+**Negative/neutral results from the same session, for completeness:** training on 2x the data
+(500k->1M S1) gave only +0.0008 (not the bottleneck).
+
+## Generic-name cap investigated and rejected; address-exact pass added (+4.25pp, biggest gain)
+
+Checked whether raising `max_group_size` (currently 50) would safely rescue the literally-
+identical-name misses noted earlier (northwind, viis, family specialists, uptown pub, new
+delhi foundation). Measured their actual group sizes: 948, 59, 690, 256, 109 respectively —
+these are common template-style names shared by hundreds of genuinely unrelated real
+businesses, not near-duplicates. Confirmed via the full group-size distribution: 8,641 groups
+in the 51-200 "rescue zone" alone (864,550 records), with pathological outliers up to 1,897
+("meridian"). Raising the cap would flood the candidate set with false positives for a
+precision-weighted metric — **rejected**, the current cap is doing its job correctly.
+
+Instead targeted the OTHER bucket from the miss diagnosis: transliteration cases where the
+address genuinely matches but the name doesn't (translated/transliterated to a different
+script). Generalized `exact_match_candidates.py` to take `--key-column` (name_core or
+address_clean) instead of hardcoding name_core. Checked the address_clean group-size
+distribution first: max group size only 41 (mean 1.23) vs. name's max of 1,897 — addresses are
+inherently far more specific, so an exact-match pass on them carries none of the genericity
+risk name-based keys do. No cap needed in practice at max_group_size=50 (nothing gets dropped).
+
+**Measured recall gain: 61.47% -> 65.72%, +4.25pp** — from only 1,137,922 new pairs (vs. 6-6.5M
+for each of the name-based passes). By far the most efficient and highest-value pass of the
+session: a fraction of the pairs, more than 1.5x the recall gain of the next-best pass
+(nospace, +2.45pp). Confirms the hypothesis from the miss diagnosis: many "unrecoverable"
+name-based misses (transliteration, heavy typos, completely different trade names for the same
+business) still have a clean, exact address match — address is the more robust signal exactly
+when name normalization/matching breaks down.
+
+Hit two more `MemoryError`/`ArrayMemoryError` crashes measuring this — this time in
+`np.unique()`'s internal hash-based dedup path on ~60-70M-element int64 arrays, despite 7-9GB
+of free RAM reported at the time (likely virtual-memory fragmentation after many hours of
+heavy pandas/numpy work in this session, not a hard resource ceiling). Fixed by switching to a
+sort-based dedup (in-place `.sort()` + boolean diff) instead of `np.unique`'s hash-table path —
+more predictable memory behavior at this scale, no more crashes after the switch. Worth
+remembering for future large-array dedup in this project: prefer sort+diff over `np.unique`
+when working with tens of millions of int64 keys.
+
+Ran the full recompute: `candidate_pairs_{split}_merged6.tsv` (train 45,707,028 pairs / test
+35,868,318 pairs) -> `features_{split}_merged6.parquet` (raw similarity features) ->
+`features_{split}_merged7.parquet` (+ rank/context features) -> resampled 500k S1 -> retrained
+with the same tuned hyperparameters (num_leaves=63, min_data_in_leaf=30, learning_rate=0.04).
+
+**Result: OOF macro F0.5 0.7059 -> 0.7501 (+0.0442, tau=0.60)** — by far the single biggest
+jump of the session, more than 3x the previous largest gain (nospace's +0.0143). Confirms the
+miss-diagnosis-driven approach: methodically sampling and categorizing real misses (instead of
+guessing) found a pattern -- address matches exactly even when name normalization fails
+completely -- that turned out to carry far more signal than any of the name-based tricks tried
+before it.
+
+Hit one more crash regenerating features at this new scale: `features.py`'s
+`_build_gt_key_set` (a small, ~2.2M-row ground-truth explode, not the big candidate-pairs one)
+hit an `ArrayMemoryError` on a 59 MiB allocation despite 9+ GB free RAM reported moments later
+-- a transient peak within that one process's lifetime, not a system-wide shortage. Fixed by
+replacing that particular `pandas.explode()` call with a plain Python loop (fast enough at this
+row count, and this is now the third pandas-explode-related crash fixed this session by
+avoiding the explode/reindex/concat code path entirely at large-ish row counts under memory
+pressure).
+
+Regenerating and validating test predictions with this model next -- current best submission
+candidate.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> **0.7501**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact). Cumulative +0.0865 (+13.0% relative) over the first real submission. Blocking
+recall over the same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) ->
+61.47% -> **65.72%**.
+
+## Address normalization fix (state abbreviations + leading zeros): +4.27pp more (27 Sep)
+
+Re-ran `diagnose_recall_misses.py` on the new (post address-exact-pass) candidate set to find
+the next target. Two dominant, clearly fixable patterns emerged from 40 fresh misses:
+1. **State name vs. abbreviation mismatch** — ~15/40 examples differ from their true match
+   ONLY in this: `'uttar pradesh'` vs `'up'`, `'west bengal'` vs `'wb'`, `'haryana'` vs `'hr'`,
+   `'california'` vs `'ca'`, etc. Otherwise byte-identical addresses that the exact-match pass
+   currently treats as different strings.
+2. **Leading zeros on house/street numbers** — `'1297 lynwood drive...'` vs
+   `'001297 lynwood drive...'`.
+
+Both are normalization gaps, not blocking-strategy gaps — fixing them in `normalize_address`
+lets the *existing* address-exact pass catch far more for free, no new key_mode needed. Added
+to `normalize.py`: a one-directional (full-name -> abbreviation only, never the reverse, which
+would be ambiguous — "or" is Oregon in a US address but Odisha in an Indian one) state-name
+canonicalization dict covering all US states + major Indian states (hand-written domain rule,
+not an external lookup, per CLAUDE.md's fair-play rules), applied as a phrase-level regex
+substitution; and a leading-zero strip restricted to the START of the address string only
+(so a genuine postal code elsewhere in the string, which can legitimately start with 0, e.g.
+some Massachusetts ZIPs, is never touched). Smoke-tested against the actual 4 examples from
+the miss sample — all 4 became byte-identical after the fix.
+
+Re-normalized all 6 `norm_{train,test}_source{1,2,3}.parquet` files (confirmed this doesn't
+touch `blocking.py`'s inputs — it only reads `name_core`/`postal_code`, both untouched by this
+fix — so the expensive multi-hour blocking pass does NOT need to be redone, only the
+address-exact pass and everything downstream of it). Re-ran the address-exact pass on train:
+pair count nearly doubled, 1,137,922 -> 2,208,396.
+
+**Measured recall: 65.72% -> 69.99%, +4.27pp** — essentially matching the original
+address-exact pass's own gain, from a pure normalization fix on top of it. Confirms address
+was even more informative than the first measurement suggested; the state-abbreviation noise
+alone was masking a large share of otherwise-clean address matches, especially for India (47%
+of test) where the state-abbreviation pattern is common.
+
+Also hit and fixed a genuine bug in `diagnose_recall_misses.py` while re-running it: its
+`np.isin()` call was still crashing with `MemoryError` even after switching `have_key_sorted`'s
+computation to sort-based dedup, because `np.isin()` unconditionally calls `np.unique()`
+*internally* on its second argument unless told not to — pre-deduping the input doesn't skip
+that internal call by itself. Fixed by passing `assume_unique=True` (valid here since both
+arguments actually are unique/sortable candidate-pair keys). Worth remembering: sort-based
+dedup alone doesn't fully replace `np.unique()`-avoidance in `np.isin()` calls — need
+`assume_unique=True` too.
+
+Ran the full recompute: `candidate_pairs_{split}_merged8.tsv` (train 46,229,295 pairs / test
+36,135,698 pairs) -> `features_{split}_merged8.parquet` (raw similarity features, now computed
+against the re-normalized address_clean) -> `features_{split}_merged9.parquet` (+ rank/context
+features) -> resampled 500k S1 -> retrained with the same tuned hyperparameters.
+
+**Result: OOF macro F0.5 0.7501 -> 0.7894 (+0.0393, tau=0.60)** — confirms the address
+normalization fix's +4.27pp recall gain (65.72% -> 69.99%) translated directly into classifier
+quality, not just noise reduction. Now within reach of the user's >0.8 target for the first
+time. Regenerating and validating test predictions with this model next.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> 0.7501 -> **0.7894**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact -> address-normalization-fix). Cumulative +0.1258 (+19.0% relative) over the
+first real submission. Blocking recall: 56.10% -> 57.75% -> 59.02% -> 61.47% -> 65.72% ->
+**69.99%**.
+
+## decide.py added + train.py now persists models (26 Sep)
+
+`train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
+data, which has no fold assignment. Added `save_models()`: each fold's booster
+(`fold_{i}.txt`), the feature-column list, and the tuned threshold go to `--model-dir/meta.json`.
+`decide.py` (new): loads that ensemble, averages all folds' predictions (standard bagging — no
+leakage risk since no fold ever saw test data), enforces exclusivity, applies the threshold, and
+writes `matching_results.tsv` + copies `candidate_pairs.tsv` through unchanged (already in the
+exact required format).
+
+**Defaults landed on**: `--max-df 50000` (calibrated middle ground — lower drops legitimate keys,
+higher reintroduces expensive joins), `--top-r-tokens 3`, `--s1-chunk-size 50000` (memory-only
+concern now, not a join-size safety net), `k=20` candidates per S1.
+
+## Stage 3 (features.py + train.py) — first end-to-end result (25 Sep, Day 1)
+
+Built while the full-train blocking run (above) proceeds in the background. Developed and
+validated against `artifacts/candidate_pairs_train_sample50k.tsv` (the 50k-S1 sample snapshot).
+
+**Two more memory bugs caught before they hit the full run** (both same root cause as earlier:
+scoping to the full dataset instead of the sample actually in scope):
+1. `features.py`'s `load_filtered()` originally loaded the full ~670MB source2/3 parquet before
+   `.isin()`-filtering — risky with as little as ~2.4-3.9GB free RAM while the concurrent
+   full-train blocking job runs. Fixed with pyarrow predicate pushdown
+   (`pd.read_parquet(..., filters=[("entity_id","in",ids)])`) so non-matching rows are never
+   materialized as Python objects at all.
+2. `attach_labels()` exploded the *full* 7.6M-row ground truth before merging against a 50k-S1
+   sample's ~983k pairs — segfaulted (exit 139) under the same concurrent memory pressure. Fixed
+   by filtering ground truth to the sample's S1 scope before exploding (same fix pattern as
+   `blocking.py`'s `measure_recall`).
+
+**26 pairwise features** (`f_` prefix): rapidfuzz ratio/partial/token_sort/token_set on core name
+and address, name token Jaccard, legal-suffix agreement, postal/house-number agreement, landmark
+flags, containment, acronym match, phone-in-name flags, name lengths. Verified on a 100-S1 smoke
+test before running full: positives had mean `f_name_ratio` 90.5 vs negatives 67.0 — clearly
+discriminative.
+
+**Model**: LightGBM, 5-fold GroupKFold by `source1_entity_id` (no S1's pairs split across
+train/val). Trained on the 50k-sample's 982,643 pairs (97,217 positives, 9.89%) in ~70s total.
+
+**Top features by gain**: `f_addr_token_set` dominates by a wide margin (2.77M, ~7.6x the next
+feature), then `f_addr_ratio`, `f_house_conflict`, `f_name_token_sort`. **Address similarity is
+the single strongest signal** — stronger than any name feature. `f_acronym_match` and
+`f_name_has_phone_a` had zero importance on this sample (rare conditions, small sample — revisit
+once trained on the full dataset).
+
+**Decision layer**: exclusivity enforced (each candidate → its single best-scoring S1 only, per
+the confirmed hard rule), then threshold τ swept in the exact macro F0.5 metric.
+
+**Result: OOF macro F0.5 = 0.6632 at τ=0.50** (singletons 0.8693, with-matches 0.6507). This is
+capped by this sample's ~56% blocking recall — a real, honest number, but expect it to rise
+substantially once blocking recall improves (Day 2 embeddings) and once trained on the full
+2.2M-row train set instead of a 50k sample. Threshold behaved sensibly: singleton accuracy rises
+monotonically with τ (as expected — higher bar to predict any match), while with-matches score
+peaks around τ=0.40-0.55, consistent with the precision/recall trade-off F0.5 is designed around.
+
+Artifacts: `artifacts/features_train_sample50k.parquet`, `artifacts/oof_train_sample50k.parquet`.
+
+## Bug caught while building `src/normalize.py` (25 Sep, Day 1)
+Two-part bug that would have silently corrupted every non-Latin-script name (Devanagari, and presumably other scripts) before either the classic 3-5 confirmed on Day 1) or the Day 2 embedding retriever ever saw the text — caught with a smoke test before it touched real data:
+1. `strip_accents` used `unicodedata.combining(c)` to detect "accent marks to strip" after NFKD decomposition. That's too broad — it strips *any* Unicode combining mark, including Devanagari vowel signs (matras), which are not accents but structural parts of the letters. Fix: only strip combining marks in the U+0300-U+036F block (where Latin accents decompose to).
+2. Separately, the punctuation-stripping regex was `[^\w\s&]` ("keep only word characters"). Python's `\w` does **not** include Unicode mark categories (Mn/Mc) — so this regex was *also* independently stripping Devanagari vowel signs (e.g. the "ो" in होटल is category `Mc`), regardless of fix #1. Fix: strip an explicit ASCII punctuation set instead of "anything not \w", so any script's letters/marks pass through untouched.
+- Verified fix with a smoke test: `होटल एंटरप्राइजेज लिमिटेड` now survives `normalize_name()` unchanged (previously became `ह टल ए टरप र इज ज ल म ट ड` — unrecoverable garbage).
+- **Lesson for the rest of the pipeline**: any future text-cleaning code must be smoke-tested against the real non-Latin samples in this file before running on full data — `\w`/accent-stripping bugs are easy to write and easy to miss if you only test on English samples.
+
+| Date | Change | Blocking recall | Avg candidates/S1 | OOF F0.5 (all / singletons / with matches) | Notes |
+|---|---|---|---|---|---|
+
+## Address-sorted-token pass + native-script state names: OOF F0.5 crosses 0.80 (27 Sep)
+
+A third `diagnose_recall_misses.py` pass (on the post-address-normalization-fix candidate set,
+69.99% recall) found two more concrete patterns: (1) **address token reordering** — the exact
+same tokens, different order (e.g. `'ward number 16 gandhi nagar...maharajganj up'` vs
+`'up maharajganj...ward number 16...gandhi nagar...'`) — directly covered by the *existing*
+`exact_match_candidates.py --key-mode sorted --key-column address_clean` combination, needing
+**zero new code**; and (2) **native-script state names** as address suffixes (e.g. `'shivam
+developers'`, identical name, address differing only in `'tg'` vs `'తెలంగాణ'`) — the earlier
+state-abbreviation fix only covered Latin-script full names.
+
+Ran the sorted-address-token pass: **+3.85pp recall** (69.99% -> 73.84%) — the third-largest
+single gain of the session. Extended `normalize.py`'s `INDIA_STATE_ABBREV` dict with
+native-script full names (Devanagari, Telugu, Bengali, Kannada, Tamil, Gujarati) for the states
+directly observed in misses — hit and fixed a self-inflicted bug along the way (two characters
+copy-pasted from the wrong Unicode script block, caught via a systematic script-consistency
+scan before it could silently corrupt data). Re-normalized all 6 source files, re-ran both
+address passes: **+0.77pp more** (73.84% -> 74.61%).
+
+Ran the full recompute on the combined result: `candidate_pairs_{split}_merged10.tsv` (train
+46,774,700 pairs / test 36,512,377 pairs) -> `features_{split}_merged10/11.parquet` -> resampled
+500k S1 -> retrained with the same tuned hyperparameters.
+
+**Result: OOF macro F0.5 0.7894 -> 0.8278 (+0.0384, tau=0.65) — first time crossing 0.80**, the
+target set explicitly for this improvement push.
+
+Hit a genuine disk-full crash partway through: `D:` filled to 100% (0 bytes free) from
+accumulating every intermediate parquet across 11 "merged" rounds this session — freed ~21GB
+by deleting clearly-superseded raw (pre-rank-features) feature files from rounds 1-8 (each
+already had a "+rank" successor that was what actually got used for training) plus the
+original pre-merge `_full.parquet` files and an abandoned 1M-S1 sample experiment. Also
+discovered mid-run that `C:` was independently at 98% full (3.8GB free) — likely the real
+root cause of several of this session's earlier "transient" memory slowdowns/crashes all
+night, since Windows' pagefile/virtual-memory commit backing typically lives there; the final
+training run completed successfully but visibly slowly under that pressure (~17,400
+cumulative CPU-seconds for a run that normally takes ~2,000). **This is a standing hardware/OS
+constraint on this machine, not something fixed by a code change** — worth clearing before any
+future session on this machine attempts full-scale work again.
+
+Regenerated and validated test predictions with this model (`models_merged11_500k`) — current
+best submission candidate.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> 0.7501 -> 0.7894 -> **0.8278**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact -> address-normalization-fix -> address-sorted+native-script-fix). Cumulative
++0.1642 (+24.7% relative) over the first real submission. Blocking recall: 56.10% -> 57.75% ->
+59.02% -> 61.47% -> 65.72% -> 69.99% -> **74.61%**.
